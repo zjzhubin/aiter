@@ -45,12 +45,7 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -336,15 +331,10 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
-    # The Gluon backend is forward-only and cannot return LSE, so drop both for it.
-    is_gluon = backend == "gluon"
-    return_lse = not is_gluon
-    test_backward = test_backward and not is_gluon
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=return_lse,
-    )
+    # The Gluon backend is forward-only.
+    return_lse = True
+    test_backward = test_backward and backend != "gluon"
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -435,12 +425,7 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()

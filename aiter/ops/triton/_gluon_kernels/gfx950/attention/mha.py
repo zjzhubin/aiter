@@ -251,12 +251,20 @@ def _attn_softmax_pv(
     qk,
     v,
     descale_v,
+    sd_base,
+    sd_offsets,
+    sd_q_mask,
+    offs_n,
+    start_n,
+    seqlen_k,
+    stride_sd_n,
     dotP: gl.constexpr,
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
 ):
     """Online-softmax rescale + P@V accumulation for one key block.
     Returns updated (acc, l_i, m_i)."""
@@ -265,6 +273,17 @@ def _attn_softmax_pv(
     p = gl.exp2(qk - m_ij[:, None])
     alpha = gl.exp2(m_i - m_ij)
     l_ij = gl.sum(p, 1)
+
+    if RETURN_SCORES:
+        # NOTE: the returned score is not the same as the reference because we
+        # need to adjust as we find new maxes per block. We are not doing that
+        p_mask = sd_q_mask[:, None] & ((start_n + offs_n)[None, :] < seqlen_k)
+        gl.amd.cdna4.buffer_store(
+            p.to(sd_base.dtype.element_ty),
+            ptr=sd_base + start_n * stride_sd_n,
+            offsets=sd_offsets,
+            mask=p_mask,
+        )
 
     acc = acc * alpha[:, None]
 
@@ -309,6 +328,10 @@ def _attn_fwd_inner(
     window_min,
     qk_scale,
     descale_v,
+    sd_base,
+    sd_offsets,
+    sd_q_mask,
+    stride_sd_n,
     mfmaLayout: gl.constexpr,
     dotK: gl.constexpr,
     dotP: gl.constexpr,
@@ -326,13 +349,14 @@ def _attn_fwd_inner(
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
 ):
     """Software-pipelined online-softmax loop over the blocks that need no
     boundary or causal mask (the sliding-window mask, if any, still applies).
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
-    if SLIDING_WINDOW > 0:
+    if SLIDING_WINDOW > 0 or RETURN_SCORES:
         offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
     else:
         offs_n = None
@@ -464,12 +488,20 @@ def _attn_fwd_inner(
             qk,
             v,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            offs_n,
+            block_min + i * BLOCK_N,
+            seqlen_k,
+            stride_sd_n,
             dotP,
             mfmaLayout,
             BLOCK_M,
             BLOCK_DMODEL_POW2,
             IS_FP8,
             FP8_MAX,
+            RETURN_SCORES,
         )
 
         # Store block i+2
@@ -504,12 +536,20 @@ def _attn_fwd_inner(
             qk,
             v,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            offs_n,
+            block_min + (n_iter - 2) * BLOCK_N,
+            seqlen_k,
+            stride_sd_n,
             dotP,
             mfmaLayout,
             BLOCK_M,
             BLOCK_DMODEL_POW2,
             IS_FP8,
             FP8_MAX,
+            RETURN_SCORES,
         )
 
     buf = (n_iter - 1) % NUM_KV_BUFFERS
@@ -538,12 +578,20 @@ def _attn_fwd_inner(
         qk,
         v,
         descale_v,
+        sd_base,
+        sd_offsets,
+        sd_q_mask,
+        offs_n,
+        block_min + (n_iter - 1) * BLOCK_N,
+        seqlen_k,
+        stride_sd_n,
         dotP,
         mfmaLayout,
         BLOCK_M,
         BLOCK_DMODEL_POW2,
         IS_FP8,
         FP8_MAX,
+        RETURN_SCORES,
     )
 
     return acc, l_i, m_i
@@ -575,6 +623,10 @@ def _attn_fwd_inner_masked(
     window_min,
     qk_scale,
     descale_v,
+    sd_base,
+    sd_offsets,
+    sd_q_mask,
+    stride_sd_n,
     mfmaLayout: gl.constexpr,
     dotK: gl.constexpr,
     dotP: gl.constexpr,
@@ -593,6 +645,7 @@ def _attn_fwd_inner_masked(
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
 ):
     """Non-pipelined online-softmax loop over the boundary / causal (and, if
     enabled, sliding-window) masked blocks.
@@ -672,12 +725,20 @@ def _attn_fwd_inner_masked(
             qk,
             v,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            offs_n,
+            start_n,
+            seqlen_k,
+            stride_sd_n,
             dotP,
             mfmaLayout,
             BLOCK_M,
             BLOCK_DMODEL_POW2,
             IS_FP8,
             FP8_MAX,
+            RETURN_SCORES,
         )
 
     return acc, l_i, m_i
@@ -692,6 +753,7 @@ _attn_fwd_repr = make_kernel_repr(
         "BLOCK_M",
         "BLOCK_N",
         "BLOCK_DMODEL",
+        "RETURN_SCORES",
         "IS_FP8",
         "VARLEN",
         "NUM_XCD",
@@ -708,6 +770,8 @@ def _attn_fwd(
     k_ptr,
     v_ptr,
     o_ptr,
+    softmax_lse_ptr,
+    s_dmask_ptr,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -733,6 +797,13 @@ def _attn_fwd(
     stride_oh_in,
     stride_om_in,
     stride_on_in,
+    stride_lse_z_in,
+    stride_lse_h_in,
+    stride_lse_m_in,
+    stride_sd_z_in,
+    stride_sd_h_in,
+    stride_sd_m_in,
+    stride_sd_n_in,
     stride_descale_q_z_in,
     stride_descale_k_z_in,
     stride_descale_v_z_in,
@@ -753,6 +824,7 @@ def _attn_fwd(
     FP8_MAX: gl.constexpr,
     ENABLE_SINK: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
@@ -789,6 +861,13 @@ def _attn_fwd(
         stride_oh = gl.cast(stride_oh_in, gl.int64)
         stride_om = gl.cast(stride_om_in, gl.int64)
         stride_on = gl.cast(stride_on_in, gl.int64)
+        stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
+        stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
+        stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
+        stride_sd_z = gl.cast(stride_sd_z_in, gl.int64)
+        stride_sd_h = gl.cast(stride_sd_h_in, gl.int64)
+        stride_sd_m = gl.cast(stride_sd_m_in, gl.int64)
+        stride_sd_n = gl.cast(stride_sd_n_in, gl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qh = stride_qh_in
@@ -809,6 +888,13 @@ def _attn_fwd(
         stride_oh = stride_oh_in
         stride_om = stride_om_in
         stride_on = stride_on_in
+        stride_lse_z = stride_lse_z_in
+        stride_lse_h = stride_lse_h_in
+        stride_lse_m = stride_lse_m_in
+        stride_sd_z = stride_sd_z_in
+        stride_sd_h = stride_sd_h_in
+        stride_sd_m = stride_sd_m_in
+        stride_sd_n = stride_sd_n_in
 
     # program -> (batch, q_head, query block). SEQLEN_Q is the max query length,
     # so NUM_BLOCKS_M matches the launch grid in both fixed and varlen mode.
@@ -1048,6 +1134,44 @@ def _attn_fwd(
     else:
         window_min = None
 
+    # softmax_lse
+    if softmax_lse_ptr is not None:
+        lse_base = (
+            softmax_lse_ptr
+            + off_z * stride_lse_z
+            + off_q_head * stride_lse_h
+            + cu_seqlens_q_start * stride_lse_m
+            + start_m * BLOCK_M * stride_lse_m
+        )
+        offs_lse = (
+            gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)) * stride_lse_m
+        ).to(gl.int32)
+        # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
+        lse_mask = offs_m < seqlen_q
+    else:
+        lse_base = None
+        offs_lse = None
+        lse_mask = None
+
+    # s_dmask (return_scores)
+    if s_dmask_ptr is not None:
+        sd_base = (
+            s_dmask_ptr
+            + off_z * stride_sd_z
+            + off_q_head * stride_sd_h
+            + start_m * BLOCK_M * stride_sd_m
+        )
+        offs_sd_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
+        offs_sd_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
+        sd_offsets = (
+            offs_sd_m[:, None] * stride_sd_m + offs_sd_n[None, :] * stride_sd_n
+        ).to(gl.int32)
+        sd_q_mask = offs_m < seqlen_q
+    else:
+        sd_base = None
+        sd_offsets = None
+        sd_q_mask = None
+
     # Classify key blocks: full (no boundary/causal mask) vs masked.
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
@@ -1082,6 +1206,14 @@ def _attn_fwd(
             if PADDED_HEAD_OUT:
                 o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
             gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
+
+            if softmax_lse_ptr is not None:
+                lse = gl.zeros(
+                    [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
+                )
+                gl.amd.cdna4.buffer_store(
+                    lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+                )
             return
 
     n_extra_tokens = 0
@@ -1145,6 +1277,10 @@ def _attn_fwd(
             window_min,
             qk_scale,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            stride_sd_n,
             mfmaLayout=mfmaLayout,
             dotK=dotK,
             dotP=dotP,
@@ -1162,6 +1298,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            RETURN_SCORES=RETURN_SCORES,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -1195,6 +1332,10 @@ def _attn_fwd(
             window_min,
             qk_scale,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            stride_sd_n,
             mfmaLayout=mfmaLayout,
             dotK=dotK,
             dotP=dotP,
@@ -1213,6 +1354,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            RETURN_SCORES=RETURN_SCORES,
         )
 
     # epilogue: normalize and write
@@ -1238,6 +1380,22 @@ def _attn_fwd(
             )
             out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
             acc = gl.where(out_ptrs_mask, acc, 0.0)
+
+    # write back LSE(Log Sum Exponents), the log of the normalization constant
+    if softmax_lse_ptr is not None:
+        LN2: gl.constexpr = 0.6931471824645996
+        # compute log-sum-exp in base 2 units
+        softmax_lse = m_i + gl.log2(l_i)
+        # convert back to natural units
+        softmax_lse = softmax_lse * LN2
+
+        if IS_CAUSAL:
+            # zero out nans caused by -infs when doing causal
+            softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
+
+        gl.amd.cdna4.buffer_store(
+            softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+        )
 
     out = acc.to(o_ptr.dtype.element_ty)
 

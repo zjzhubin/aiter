@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import os
 import warnings
 from typing import Literal
@@ -339,9 +340,11 @@ def _gluon_flash_attn_forward(
     # assert (not IS_FP8) or (
     #     pe_head_dim % 64 == 0
     # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
-    head_stride_aligned_8 = (
-        q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
-    )
+
+    # Largest power of two, capped at the 128-bit load width, that divides every
+    # head-axis stride. gcd against a power of two can only return a power of two,
+    # so this is always a valid alignment hint for the kernel's head offsets.
+    head_stride_align = math.gcd(16, q_strides[1], k_strides[1], v_strides[1])
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
@@ -388,7 +391,7 @@ def _gluon_flash_attn_forward(
         ENABLE_SINK=sink is not None,
         SLIDING_WINDOW=sliding_window,
         RETURN_SCORES=return_softmax,
-        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        HEAD_STRIDE_ALIGN=head_stride_align,
         **config,
     )
 

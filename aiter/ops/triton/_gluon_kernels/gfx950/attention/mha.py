@@ -456,7 +456,7 @@ def _attn_fwd_inner(
 
 
 _attn_fwd_repr = make_kernel_repr(
-    "_attn_fwd",
+    "_attn_fwd_gluon",
     [
         "IS_CAUSAL",
         "NUM_Q_HEADS",
@@ -1135,11 +1135,9 @@ def _attn_fwd(
 
 
 def _get_config(is_fp8: bool, has_pe: bool = False):
-    if not hasattr(_get_config, "_config_dict"):
-        arch = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
-        _get_config._config_dict = load_config_json(fpath)
-    fwd_cfg = _get_config._config_dict["fwd"]
+    arch = arch_info.get_arch()
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
+    fwd_cfg = load_config_json(fpath)["fwd"]
     # TODO: configs are not tuned
     if is_fp8:
         return fwd_cfg["fp8"]

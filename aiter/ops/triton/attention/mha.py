@@ -950,7 +950,8 @@ def flash_attn_func(
             bias=bias,
             alibi_slopes=alibi_slopes,
         )
-        assert reason is None, reason
+        if reason is not None:
+            raise ValueError(reason)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
@@ -1313,7 +1314,8 @@ def flash_attn_varlen_func(
             alibi_slopes=alibi_slopes,
             block_table=block_table,
         )
-        assert reason is None, reason
+        if reason is not None:
+            raise ValueError(reason)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         attn_out, softmax_lse, s_dmask = _gluon_flash_attn_forward(

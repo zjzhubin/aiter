@@ -465,6 +465,7 @@ _attn_fwd_repr = make_kernel_repr(
         "BLOCK_N",
         "BLOCK_DMODEL",
         "RETURN_SCORES",
+        "HEAD_STRIDE_ALIGN",
         "IS_FP8",
         "VARLEN",
         "NUM_XCD",

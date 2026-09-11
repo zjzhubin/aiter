@@ -156,7 +156,7 @@ def _gluon_flash_attn_forward(
     sm_scale: float,
     causal: bool,
     window_size: tuple[int, int],
-    return_lse: bool,  # Not used
+    return_lse: bool,
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
@@ -168,7 +168,7 @@ def _gluon_flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
 
@@ -178,7 +178,8 @@ def _gluon_flash_attn_forward(
         causal: whether to apply a (bottom-right aligned) causal mask.
         window_size: (left, right) local attention window. Only a left window is
             supported, so right must be -1.
-        return_lse: not used, the log-sum-exp is always computed.
+        return_lse: allocate and write the log-sum-exp. When False the kernel
+            skips the LSE epilogue entirely.
         return_softmax: also write out the per-block softmax probabilities.
         max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         o: optional preallocated output, shaped like q but with V's head dim.
@@ -192,7 +193,8 @@ def _gluon_flash_attn_forward(
         o: same layout as q. Dtype is fp32 for fp8 inputs unless the caller passed
             an ``o`` of a different dtype, in which case that dtype is returned.
         softmax_lse: fp32 log-sum-exp, shaped (batch, num_q_heads, max_seqlen_q)
-            for bshd and (total_q, num_q_heads) for varlen.
+            for bshd and (total_q, num_q_heads) for varlen, or None when
+            ``return_lse`` is False.
         s_dmask: fp32 (batch, num_q_heads, max_seqlen_q, max_seqlen_k) softmax
             probabilities, or None when ``return_softmax`` is False.
     """
@@ -287,17 +289,23 @@ def _gluon_flash_attn_forward(
             o.dtype == o_dtype
         ), f"Gluon MHA out dtype mismatch: expected {o_dtype}, got {o.dtype}"
 
-    # softmax_lse [batch, num_q_heads, seqlen_q]
-    if varlen:
-        softmax_lse = torch.zeros(
-            (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
-        )
-        lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
+    # softmax_lse [batch, num_q_heads, seqlen_q] (bshd) or
+    # [total_q, num_q_heads] (varlen). Skip the buffer when the caller does
+    # not want LSE so the kernel can drop the epilogue store.
+    if return_lse:
+        if varlen:
+            softmax_lse = torch.zeros(
+                (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
+            )
+            lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
+        else:
+            softmax_lse = torch.zeros(
+                (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
+            )
+            lse_strides = softmax_lse.stride()
     else:
-        softmax_lse = torch.zeros(
-            (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
-        )
-        lse_strides = softmax_lse.stride()
+        softmax_lse = None
+        lse_strides = (0, 0, 0)
 
     # s_dmask [batch, num_q_heads, seqlen_q, seqlen_k]
     if return_softmax:
@@ -915,6 +923,7 @@ def flash_attn_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_lse: bool. Whether to return the log-sum-exp of each attention row.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -932,7 +941,7 @@ def flash_attn_func(
             zeroed.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
@@ -1278,6 +1287,7 @@ def flash_attn_varlen_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_lse: bool. Whether to return the log-sum-exp of each attention row.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -1295,7 +1305,7 @@ def flash_attn_varlen_func(
             zeroed.
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+        softmax_lse [optional, if return_lse=True]: (total_q, nheads). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).

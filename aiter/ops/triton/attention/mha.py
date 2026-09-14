@@ -149,6 +149,25 @@ def gluon_forward_unsupported_reason(
     return None
 
 
+def check_gluon_forward_support(**feature_flags) -> None:
+    reason = gluon_forward_unsupported_reason(**feature_flags)
+    if reason is not None:
+        raise ValueError(reason)
+
+
+def _get_softmax_scale(q: torch.Tensor, softmax_scale: float | None) -> float:
+    return q.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
+
+
+def _pack_attn_returns(out, softmax_lse, s_dmask, return_lse, return_attn_probs):
+    result = [out]
+    if return_lse:
+        result.append(softmax_lse)
+    if return_attn_probs:
+        result.append(s_dmask)
+    return result[0] if len(result) == 1 else tuple(result)
+
+
 def _gluon_flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -698,8 +717,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = _get_softmax_scale(q, softmax_scale)
         head_size_og = q.size(3)
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
@@ -739,13 +757,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
 
         out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
+        return _pack_attn_returns(out, softmax_lse, S_dmask, return_lse, return_softmax)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -954,15 +966,12 @@ def flash_attn_func(
     )
 
     if backend == "gluon":
-        reason = gluon_forward_unsupported_reason(
+        check_gluon_forward_support(
             dropout_p=dropout_p,
             bias=bias,
             alibi_slopes=alibi_slopes,
         )
-        if reason is not None:
-            raise ValueError(reason)
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = _get_softmax_scale(q, softmax_scale)
         out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
             q,
             k,
@@ -980,12 +989,9 @@ def flash_attn_func(
             sink=sink,
             config=config,
         )
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_attn_probs:
-            result.append(s_dmask)
-        return result[0] if len(result) == 1 else tuple(result)
+        return _pack_attn_returns(
+            out, softmax_lse, s_dmask, return_lse, return_attn_probs
+        )
 
     return _FlashAttnFunc.apply(
         q,
@@ -1035,8 +1041,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
         )
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = _get_softmax_scale(q, softmax_scale)
         head_size_og = q.size(2)
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
@@ -1080,13 +1085,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
         out = out_padded[..., :head_size_og]
 
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
+        return _pack_attn_returns(out, softmax_lse, S_dmask, return_lse, return_softmax)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -1318,16 +1317,13 @@ def flash_attn_varlen_func(
     )
 
     if backend == "gluon":
-        reason = gluon_forward_unsupported_reason(
+        check_gluon_forward_support(
             dropout_p=dropout_p,
             bias=bias,
             alibi_slopes=alibi_slopes,
             block_table=block_table,
         )
-        if reason is not None:
-            raise ValueError(reason)
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
+        softmax_scale = _get_softmax_scale(q, softmax_scale)
         attn_out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
             q,
             k,
@@ -1348,12 +1344,9 @@ def flash_attn_varlen_func(
             sink=sink,
             config=config,
         )
-        result = [attn_out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_attn_probs:
-            result.append(s_dmask)
-        return result[0] if len(result) == 1 else tuple(result)
+        return _pack_attn_returns(
+            attn_out, softmax_lse, s_dmask, return_lse, return_attn_probs
+        )
 
     return _FlashAttnVarlenFunc.apply(
         q,
@@ -1435,8 +1428,7 @@ def flash_attn_with_kvcache(
             "num_splits > 1 not supported in v2 KV cache backend yet"
         )
 
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
+    softmax_scale = _get_softmax_scale(q, softmax_scale)
 
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(

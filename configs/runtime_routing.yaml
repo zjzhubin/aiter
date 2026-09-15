@@ -1,0 +1,153 @@
+# Runtime routing table (v1, 2026-08-30)
+# Loaded by aiter/dist/routing.py (layers 2/3) and vllm/runtime_routing.py (layer 1).
+# Override path: AITER_RUNTIME_ROUTING=/path/to/other.yaml
+# Kill switches: AITER_ROUTING_SERVE=0 / AITER_ROUTING_KERNEL=0 / AITER_ROUTING_AR=0
+# Missing file / parse error / no profile match -> built-in defaults identical to
+# the pre-routing hardcoded behavior (never fail-fast).
+version: 1
+
+# ── Layer 1: serve-profile routing (model config attributes -> vllm serve params) ──
+# match: all fields AND; list value = membership; dotted path descends into nested
+# config (text_config.* reads the nested main-model section of Qwen3_5 configs).
+serve_profiles:
+
+  qwen3_5_w4a16_int4:
+    match:
+      architectures: [Qwen3_5ForConditionalGeneration]
+      quantization_config.quant_method: compressed-tensors
+      quantization_config.format: pack-quantized
+    params:
+      tensor_parallel_size: 2
+      max_model_len: 262144
+      max_num_seqs: 8
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      gpu_memory_utilization: 0.8
+      kv_cache_dtype: fp8
+      enable_prefix_caching: true
+      attention_backend: ROCM_AITER_UNIFIED_ATTN
+      speculative:
+        method: dflash
+        num_speculative_tokens: 2
+        attention_backend: ROCM_AITER_UNIFIED_ATTN
+        draft_model_match:
+          architectures: [DFlash2DraftModel]
+          quantization_config.quant_method: [compressed-tensors, null]
+      env:
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"
+        VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
+        AITER_ROPE_NATIVE_BACKEND: "1"
+        RDNA_AITER_SAMPLER: "1"
+        FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+
+  qwen3_5_official_fp8:
+    match:
+      architectures: [Qwen3_5ForConditionalGeneration]
+      quantization_config.quant_method: [fp8, compressed-tensors]
+      quantization_config.format: [float-quantized, null]  # null covers official fp8 (no format field)
+    params:
+      tensor_parallel_size: 2
+      max_model_len: 262144
+      max_num_seqs: 8
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      gpu_memory_utilization: 0.8
+      kv_cache_dtype: fp8
+      enable_prefix_caching: true
+      attention_backend: ROCM_AITER_UNIFIED_ATTN
+      env:
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"
+        VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
+        AITER_ROPE_NATIVE_BACKEND: "1"
+        RDNA_AITER_SAMPLER: "1"
+        FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+
+  qwen3_5_quark:
+    match:
+      architectures: [Qwen3_5ForConditionalGeneration]
+      quantization_config.quant_method: quark
+    params:
+      tensor_parallel_size: 2
+      max_model_len: 262144
+      max_num_seqs: 8
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      gpu_memory_utilization: 0.8
+      kv_cache_dtype: fp8
+      enable_prefix_caching: true
+      attention_backend: ROCM_AITER_UNIFIED_ATTN
+      env:
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_CUSTOM_AR: "1"
+        VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
+        AITER_ROPE_NATIVE_BACKEND: "1"
+        RDNA_AITER_SAMPLER: "1"
+        FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+
+  unsupported:
+    match: {} # catch-all: profiles above are declared first, so this only
+    # fires for models with no intentional serve path (mlx-format quant,
+    # VL embedding models).
+    params:
+      unsupported: true
+      reason: no serve profile matched; add one to runtime_routing.yaml
+
+# ── Layer 2: fused-AR kernel dispatch routing ──
+# Defaults (when table absent/disabled) mirror the pre-routing constants:
+#   hidden_ok = hidden % pack == 0 and hidden // pack <= 1024
+#   token_ok  = token_num <= 80
+#   size_ok   = ws==2 or (fully_connected and ws<=4 and bytes<256KiB)
+#               or (fully_connected and ws<=8 and bytes<128KiB)
+kernel_dispatch:
+  fused_ar_rms:
+    # Fusion compile-range gate: the vLLM allreduce_rms fusion pass only
+    # applies to compile ranges with end <= this value. Microbenchmark
+    # (2026-08-30, publish-then-reduce fused 1stage vs bare AR + norm):
+    # m<=48 wins (+2~34%, crossover between 48 and 64), m>=64 loses
+    # (-22%). Covers all decode+dflash2 batches (m<=24 at max_num_seqs=8).
+    max_tokens_gate: 48
+    rules:
+      - name: 1stage
+        when:
+          world_size: 2
+          max_hidden_packs: 1024
+          max_token_num: 48
+          require_hidden_pack_aligned: true
+        select: {use_1stage: true}
+      - name: 1stage_fullmesh_small
+        when:
+          fully_connected: true
+          world_size: [2, 3, 4]
+          max_total_bytes: 262144
+          max_hidden_packs: 1024
+          max_token_num: 80
+          require_hidden_pack_aligned: true
+        select: {use_1stage: true}
+      - name: 1stage_fullmesh_8
+        when:
+          fully_connected: true
+          world_size: [5, 6, 7, 8]
+          max_total_bytes: 131072
+          max_hidden_packs: 1024
+          max_token_num: 80
+          require_hidden_pack_aligned: true
+        select: {use_1stage: true}
+      - name: 2stage
+        when: {}
+        select: {use_1stage: false}
+
+# ── Layer 3: AR backend priority routing ──
+# order overrides the compiled dispatch order in cuda_communicator.all_reduce;
+# gates bound each backend with a (min_bytes, max_bytes] window.
+# Defaults replicate today's behavior: AITER_CUSTOM tries first (when enabled),
+# PYNCCL is the terminal fallback with no window.
+ar_backends:
+  order: [AITER_CUSTOM, PYNCCL]
+  gates:
+    AITER_CUSTOM:
+      min_bytes: 0
+      max_bytes: 67108864 # 64 MiB: decode+prefill window for 2xR9700 PCIe
+    PYNCCL:
+      fallback: true

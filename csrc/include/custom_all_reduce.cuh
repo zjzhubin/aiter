@@ -176,9 +176,12 @@ DINLINE void start_sync(const RankSignals& sg,
                                 __ATOMIC_RELAXED,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
+        // SYSTEM scope on the acquire side — peer flags arrive over
+        // PCIe from another device scope; a DEVICE-scope load establishes no
+        // synchronizes-with with them outside xGMI (gfx1201 read stale data).
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                      __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
@@ -228,9 +231,13 @@ DINLINE void end_sync(const RankSignals& sg,
                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
+        // SYSTEM scope on the acquire side — pairs with the
+        // SYSTEM-scope RELEASE store above. DEVICE-scope acquire does not
+        // synchronize with a peer GPU's release outside the xGMI coherence
+        // domain (MI300 masks this; gfx1201 PCIe exposes it).
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                      final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
@@ -264,12 +271,31 @@ DINLINE void end_sync(const RankSignals& sg,
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx)
 {
-    A tmp = upcast(ptrs[0][idx]);
+    // Peer payload reads must bypass the local L2 — a peer's
+    // PCIe write invalidates nothing in the local device's cache, so a cached line from the
+    // previous round survives every handshake (round0 correct, round1+ stale;
+    // a scope-only fix alone changed nothing, identical failure signature).
+    // Nontemporal loads re-fetch from memory, mirroring the gfx1250 LL
+    // kernel's payload access discipline. Same code runs on MI300 where a
+    // fresh fetch is merely redundant, not wrong.
+    auto nt_load = [](const P* p) {
+        alignas(16) P v;
+        if constexpr(sizeof(P) == 16)
+        {
+            v = __builtin_nontemporal_load(reinterpret_cast<const long long*>(p));
+        }
+        else
+        {
+            v = *p;
+        }
+        return v;
+    };
+    A tmp = upcast(nt_load(&ptrs[0][idx]));
 #pragma unroll
     for(int i = 1; i < ngpus; i++)
     {
         packed_assign_add<typename opus::vector_traits<A>::dtype, opus::vector_traits<A>::size()>(
-            tmp, upcast(ptrs[i][idx]));
+            tmp, upcast(nt_load(&ptrs[i][idx])));
     }
     return downcast<P>(tmp);
 }
@@ -389,93 +415,43 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
 
-    constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    // note: we don't reorder the address so the accumulation order is the same
-    // for all ranks, ensuring bitwise identical results
-    auto dp     = *_input_dp;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
+    // Publish-then-reduce. A PCIe peer cannot snoop this
+    // GPU 's L2, so payload written by regular stores (upstream kernels or
+    // the eager copy-in memcpy) can linger as dirty lines invisible to the
+    // peer, which then reads stale DRAM (round0 correct after the JIT-build
+    // L2 flush, round1+ wrong). Fix: publish the input into the UNCACHE meta
+    // scratch with nontemporal stores, barrier, then reduce from every
+    // rank's published scratch instead of its raw input buffer.
+    // Accumulation order i=0..ngpus-1 preserved (bitwise identical results).
+    auto dp = *_input_dp;
 
-    // --- double buffer: tmp_smem[0] and tmp_smem[1] ---
-    __shared__ P tmp_smem[2][tnum_gpu * ngpus];
-
-    const int step  = gridDim.x * tnum_gpu;
-    const int start = blockIdx.x * tnum_gpu + lane_id;
-
-    start_sync<ngpus>(sg, self_sg, rank);
-
-    // --- compute uniform iteration count (to keep barriers well-formed) ---
-    const int first = blockIdx.x * tnum_gpu;
-    int iters       = 0;
+    P* my_pub      = get_tmp_buf<P>(self_sg);
+    const P* my_in = (const P*)dp.ptrs[rank];
     {
-        int rem = size - first;
-        iters   = rem > 0 ? (rem + step - 1) / step : 0;
-    }
-
-    // -------------------------------
-    // fill buffer 0
-    // -------------------------------
-    int buf  = 0;
-    int idx0 = start;
-
-    if(idx0 < size)
-    {
-        P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
-        tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
-    }
-    __syncthreads();
-
-    for(int it = 0; it < iters; ++it)
-    {
-        const int cur_idx  = idx0 + it * step;
-        const int next_idx = cur_idx + step;
-        const int next_buf = buf ^ 1;
-
-        // =======================================================
-        // 1. Warp 0 REDUCES current buffer
-        // =======================================================
-        if(warp_id == 0 && cur_idx < size)
+        int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+        int stride = gridDim.x * blockDim.x;
+        for(int idx = tid; idx < size; idx += stride)
         {
-            // GPU 0 contribution
-            P v0 = tmp_smem[buf][0 * tnum_gpu + lane_id];
-
-            A acc;
-#pragma unroll
-            for(int j = 0; j < pack_size; ++j)
-                acc[j] = upcast_s(v0[j]);
-
-            // GPUs 1..(ngpus-1)
-#pragma unroll
-            for(int g = 1; g < ngpus; ++g)
-            {
-                P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                    acc[j] += upcast_s(vg[j]);
-            }
-
-            // store result
-            P out;
-#pragma unroll
-            for(int j = 0; j < pack_size; ++j)
-                out[j] = downcast_s<T>(acc[j]);
-
-            ((P*)result)[cur_idx] = out;
+            my_pub[idx] = my_in[idx];
         }
+    }
+    // RELEASE barrier: every rank's publishes are now system-visible
+    end_sync<ngpus>(sg, self_sg, rank);
 
-        // =======================================================
-        // 2. ALL warps prefetch NEXT buffer
-        //    (including warp 0; safe to issue after reduction)
-        // =======================================================
-        if(next_idx < size)
-        {
-            P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
-            tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
-        }
+    // reduce from peers' published scratch, NOT their raw input
+    const P* pub_ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+        pub_ptrs[i] = get_tmp_buf<P>(sg.signals[i]);
 
-        __syncthreads();
-
-        buf = next_buf;
+    for(int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+        idx += gridDim.x * blockDim.x)
+    {
+        A acc = upcast(pub_ptrs[0][idx]);
+#pragma unroll
+        for(int i = 1; i < ngpus; i++)
+            acc = acc + upcast(pub_ptrs[i][idx]);
+        ((P*)result)[idx] = downcast<P>(acc);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -1969,14 +1945,45 @@ __global__ void __launch_bounds__(1024, 1)
     int token_num           = size / hidden_dim;
     int access_id_in_token  = threadIdx.x * pack_size;
     const P* ptrs[ngpus];
-    P* tmps[ngpus];
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
         ptrs[i] = (const P*)_dp->ptrs[i];
-        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
-    start_sync<ngpus>(sg, self_sg, rank);
+    // Publish-then-reduce (fused). Same discipline as the bare
+    // AR kernel: a PCIe peer cannot snoop this GPU's L2, so raw inputs
+    // (regular stores from upstream kernels / eager copy-in memcpy) may be
+    // invisible to peers. Stage the input into the UNCACHED meta scratch
+    // first, barrier with RELEASE/ACQUIRE semantics, then reduce from every
+    // rank's scratch instead of raw inputs. Accumulation order r=0..ngpus-1
+    // preserved (bitwise identical results).
+    {
+        P* my_pub        = get_tmp_buf<P>(self_sg);
+        const P* my_in   = (const P*)_dp->ptrs[rank];
+        // Stage the full input in ITS OWN layout (m * input_hidden_dim
+        // elements): the reduce loop indexes via input_idx computed from
+        // input_hidden_dim, so the published copy must mirror the input
+        // layout exactly. For the pad variant input_hidden_dim >= hidden_dim;
+        // for the plain variant they are equal.
+        int total_packs = size / hidden_dim * (input_hidden_dim / pack_size);
+        for(int pk = (int)(threadIdx.x + (size_t)blockIdx.x * blockDim.x);
+            pk < total_packs;
+            pk += (int)(gridDim.x * blockDim.x))
+        {
+            my_pub[pk] = my_in[pk];
+        }
+    }
+    // RELEASE/ACQUIRE barrier: every rank's published scratch is now visible
+    // (end_sync non-final = SYSTEM-scope release store + acquire load).
+    end_sync<ngpus, false>(sg, self_sg, rank);
+    // Reduce from peers' published scratch; own contribution stays local
+    // (raw input is coherent on-device and hot in L2).
+    const P* pub[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        pub[i] = (i == rank) ? (const P*)_dp->ptrs[rank] : (const P*)get_tmp_buf<P>(sg.signals[i]);
+    }
     for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
     {
         int input_idx    = tidx * input_hidden_dim + access_id_in_token;
@@ -1988,7 +1995,7 @@ __global__ void __launch_bounds__(1024, 1)
         P weight_p{};
         if(active)
         {
-            vec = ptrs[0][input_idx / pack_size];
+            vec = pub[0][input_idx / pack_size];
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
@@ -1998,7 +2005,7 @@ __global__ void __launch_bounds__(1024, 1)
 #pragma unroll
             for(int r = 1; r < ngpus; ++r)
             {
-                vec = ptrs[r][input_idx / pack_size];
+                vec = pub[r][input_idx / pack_size];
 #pragma unroll
                 for(int v = 0; v < pack_size; ++v)
                 {

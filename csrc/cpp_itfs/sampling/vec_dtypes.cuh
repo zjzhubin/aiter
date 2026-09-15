@@ -353,7 +353,9 @@ struct vec_cast<FP8_E4M3_TYPE, half>
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
         {
-            dst[0] = FP8_E4M3_TYPE(src[0]);
+dst[0].__x = __hip_cvt_halfraw_to_fp8(
+            *reinterpret_cast<const __half_raw*>(&src[0]),
+            __HIP_SATFINITE, __HIP_E4M3);
         }
         else
         {
@@ -371,7 +373,9 @@ struct vec_cast<FP8_E4M3_TYPE, half>
 #pragma unroll
         for(size_t i = 0; i < vec_size; ++i)
         {
-            dst[i] = FP8_E4M3_TYPE(src[i]);
+dst[i].__x = __hip_cvt_halfraw_to_fp8(
+            *reinterpret_cast<const __half_raw*>(&src[i]),
+            __HIP_SATFINITE, __HIP_E4M3);
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     }
@@ -435,7 +439,9 @@ struct vec_cast<FP8_E5M2_TYPE, half>
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
         {
-            dst[0] = FP8_E5M2_TYPE(src[0]);
+dst[0].__x = __hip_cvt_halfraw_to_fp8(
+            *reinterpret_cast<const __half_raw*>(&src[0]),
+            __HIP_SATFINITE, __HIP_E5M2);
         }
         else
         {
@@ -452,7 +458,9 @@ struct vec_cast<FP8_E5M2_TYPE, half>
 #pragma unroll
         for(size_t i = 0; i < vec_size; ++i)
         {
-            dst[i] = FP8_E5M2_TYPE(src[i]);
+dst[i].__x = __hip_cvt_halfraw_to_fp8(
+            *reinterpret_cast<const __half_raw*>(&src[i]),
+            __HIP_SATFINITE, __HIP_E5M2);
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     }

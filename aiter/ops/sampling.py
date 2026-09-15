@@ -81,20 +81,41 @@ _TOPK_FIRST_FAST_MAX_K = 256
 _TOPK_FIRST_FAST_MIN_VOCAB = 65536
 
 
+def _resolve_top_k(
+    maybe_top_k_arr: torch.Tensor | None,
+    top_k_val: int,
+) -> int | None:
+    """Resolve the effective scalar top-k from the (tensor, scalar) pair.
+
+    vLLM V1 always passes a per-token int32 tensor for top-k
+    (gpu_input_batch.top_k) even when every request shares the same value
+    (e.g. a uniform top_k, or the default -> vocab_size). Fold the tensor to a
+    scalar when all entries are equal so the top-k-first fast path can trigger;
+    return None when per-row values differ (those must go through the fused
+    kernel).
+    """
+    if maybe_top_k_arr is None:
+        return top_k_val if isinstance(top_k_val, int) else None
+    if top_k_val != 0:
+        return top_k_val if isinstance(top_k_val, int) else None
+    uniq = maybe_top_k_arr.unique()
+    if uniq.numel() != 1:
+        return None
+    return int(uniq.item())
+
+
 def _topk_first_fast_path_applicable(
     probs: torch.Tensor,
     indices: torch.Tensor | None,
-    maybe_top_k_arr: torch.Tensor | None,
-    top_k_val: int,
+    top_k: int | None,
 ) -> bool:
     return (
         indices is None
-        and maybe_top_k_arr is None
-        and isinstance(top_k_val, int)
-        and 0 < top_k_val <= _TOPK_FIRST_FAST_MAX_K
+        and top_k is not None
+        and 0 < top_k <= _TOPK_FIRST_FAST_MAX_K
         and probs.dim() == 2
         and probs.size(-1) >= _TOPK_FIRST_FAST_MIN_VOCAB
-        and top_k_val < probs.size(-1)
+        and top_k < probs.size(-1)
     )
 
 
@@ -176,10 +197,11 @@ def top_k_top_p_sampling_from_probs(
     top_p_val: float,
     deterministic: bool = False,
 ) -> torch.Tensor:
-    if _topk_first_fast_path_applicable(probs, indices, maybe_top_k_arr, top_k_val):
+    top_k = _resolve_top_k(maybe_top_k_arr, top_k_val)
+    if _topk_first_fast_path_applicable(probs, indices, top_k):
         return _topk_first_fast_path(
             probs,
-            top_k_val,
+            top_k,
             maybe_top_p_arr,
             top_p_val,
             deterministic,

@@ -1,3 +1,21 @@
+> **This is a fork.** Branch `gfx1201-r9700` adds AMD Radeon AI PRO R9700 (RDNA4 /
+> `gfx1201`) support — architecture registration and compile flags, unified attention on
+> gfx1201, hardware FP8 conversion in sampling, custom all-reduce PCIe visibility, and GEMM
+> configs keyed on the runtime CU count — as the operator-library half of a two-repository
+> stack. The other half, and everything you need to actually use this — the usage guide, the
+> model matrix, the environment switches, the measured performance with its caveats, the build
+> recipe and the patch series — lives in
+> **[zjzhubin/vllm](https://github.com/zjzhubin/vllm). Read its README first.** Both
+> repositories carry the tag `gfx1201-r9700-v1.0-public`.
+>
+> **本仓库是 fork。** 分支 `gfx1201-r9700` 提供 RDNA4 / `gfx1201` 支持，是这套双仓库栈的
+> 算子库那一半。另一半以及上手所需的一切——使用说明、模型矩阵、环境开关、带保留意见的
+> 实测性能、构建食谱与补丁包——都在
+> **[zjzhubin/vllm](https://github.com/zjzhubin/vllm)，请先读那边的 README。**
+> 两个仓库都带有 tag `gfx1201-r9700-v1.0-public`。
+
+---
+
 <div align="center">
 <img src="docs/assets/aiter_logo.png" alt="AITER" width="400">
 <br><br>

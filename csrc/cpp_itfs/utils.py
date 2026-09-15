@@ -153,6 +153,8 @@ def validate_and_update_archs():
         "gfx942",
         "gfx950",
         "gfx1151",
+        # gfx1201 is supported by the hipb_mm / gfx12 triton paths
+        "gfx1201",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -239,7 +241,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
             ]
-        if hip_version > Version("6.2.41133"):
+        if hip_version > Version("6.2.41133") and "gfx1201" not in GPU_ARCH:
             cxxflags += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]

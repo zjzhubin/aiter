@@ -1074,7 +1074,7 @@ def build_module(
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
             ]
-        if hip_version > Version("6.2.41133"):
+        if hip_version > Version("6.2.41133") and get_gfx() != "gfx1201":
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]

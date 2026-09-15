@@ -43,7 +43,9 @@ except:  # noqa: E722
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1201", "gfx1250")
+IS_DEVICE_ARCH_GFX1250 = DEVICE_ARCH == "gfx1250"
+IS_DEVICE_ARCH_GFX1201 = DEVICE_ARCH == "gfx1201"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
@@ -307,6 +309,9 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = config["TILE_SIZE"]
+        if IS_DEVICE_ARCH_GFX1201:
+            # gfx1201 64 KiB LDS/shared-memory limit
+            TILE_SIZE = min(TILE_SIZE, 32)
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -462,6 +467,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
+    if IS_DEVICE_ARCH_GFX1201:
+        # gfx1201 64 KiB LDS/shared-memory limit
+        config["TILE_SIZE"] = min(config["TILE_SIZE"], 32)
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
